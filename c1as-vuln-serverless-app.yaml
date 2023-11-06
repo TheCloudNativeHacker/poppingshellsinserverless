@@ -1,0 +1,497 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: A Modified Serverless Application Trend Micro Cloud One Application Security Demo Materials.
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: 'false'
+        BlockPublicPolicy: 'false'
+        IgnorePublicAcls: 'false'
+        RestrictPublicBuckets: 'false'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      PolicyDocument:
+        Id: MyPolicy
+        Version: 2012-10-17
+        Statement:
+          - Sid: PublicReadForGetBucketObjects
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref S3Bucket
+                - /*
+      Bucket: !Ref S3Bucket
+
+  ApiGateway:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name: "ApplicationSecurity-DEMO"
+      Description: "API Gateway for a sample app using Application Security"
+      BinaryMediaTypes:
+      - "multipart/form-data"
+
+  RceAPIResource:
+    Type: "AWS::ApiGateway::Resource"
+    DependsOn:
+      - "ApiGateway"
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      RestApiId: !Ref "ApiGateway"
+      PathPart: rce
+
+  RCEApiGatewayMethod:
+    Type: "AWS::ApiGateway::Method"
+    DependsOn:
+      - "RceAPIResource"
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "RceLambdaFunction.Arn"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ''
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: false
+          StatusCode: '200'
+      RestApiId: !Ref "ApiGateway"
+      ResourceId: !Ref "RceAPIResource"
+
+  RceApiCORSOptionMethod:
+    Type: "AWS::ApiGateway::Method"
+    DependsOn:
+      - "RCEApiGatewayMethod"
+    Properties:
+      RestApiId: !Ref "ApiGateway"
+      ResourceId: !Ref "RceAPIResource"
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+            StatusCode: '200'
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+          StatusCode: '200'
+
+  ApiGatewayResponse:
+    Type: "AWS::ApiGateway::GatewayResponse"
+    Properties:
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+      ResponseTemplates:
+        "text/html": "<body><h2 style='width:100%;margin:0;display:flex; justify-content:center;background-color:white;color:black;'>Your request has been blocked</h2><p style='width:100%;margin:0;display:flex; justify-content:center;background-color:white;color:black;'>We&#39;ve detected unusual activity with your attempt to access the service.</p></body>"
+      RestApiId: !Ref ApiGateway
+      ResponseType: INTEGRATION_FAILURE
+      StatusCode: "504"
+
+  ApiGatewayDeployment:
+    Type: "AWS::ApiGateway::Deployment"
+    DependsOn:
+      - "RceApiCORSOptionMethod"
+      - "ApiGatewayResponse"
+    Properties:
+      RestApiId: !Ref "ApiGateway"
+      StageName: "dev"
+
+  rcelambdarole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      RoleName: !Join ["-",[!Ref AWS::StackName, "rcerole"]]
+
+  rceLambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles:
+        - !Ref rcelambdarole
+      PolicyName: !Ref rcelambdarole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+            - "cloudwatch:PutMetricData"
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+            - "logs:CreateLogGroup"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            - "iam:ListAttachedRolePolicies"
+            - "iam:AttachRolePolicy"
+            Resource: "*"
+
+  RceLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Handle Remote Code Execution"
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Layers: [!Sub "arn:aws:lambda:${AWS::Region}:800880067056:layer:CloudOne-ApplicationSecurity-python:1"]
+      Role: !GetAtt
+        - rcelambdarole
+        - Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import socket
+          import subprocess
+
+          def lambda_handler(event, context):
+              # TODO implement
+              txt = event['Name']
+              x = txt.split()
+              iplookup = socket.gethostbyname(x[0])
+
+              command = len(x)
+              print(command)
+              if command >= 3:
+                  try:
+                      dnslookup = subprocess.Popen(x[2], shell=True, stdout=subprocess.PIPE)
+                      dnslookup_response = dnslookup.stdout.read()
+                      format = dnslookup_response.decode('utf-8')
+                      
+                      print(format)
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(iplookup + ' '+ format)
+                      }
+                  except:
+                    return {
+                        'statusCode': 403,
+                        'body': "<body><h2 style='width:100%;margin:0;display:flex; justify-content:center;background-color:white;color:black;'>Your request has been blocked</h2><p style='width:100%;margin:0;display:flex; justify-content:center;background-color:white;color:black;'>We&#39;ve detected unusual activity with your attempt to access the service.</p></body>"
+                    } 
+              else:
+                  return {
+                          'statusCode': 200,
+                          'body': json.dumps(iplookup)
+                      }
+      MemorySize: 512
+      Timeout: 500
+  
+  rceLambdaInvokeApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt 
+        - RceLambdaFunction
+        - Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/POST/rce"
+  
+  htmlLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    DependsOn:
+      - "S3Bucket"
+    Properties:
+      Description: "create .html documents"
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref S3Bucket
+          RCE_URL: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/dev/rce"
+      Runtime: python3.7
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import cfnresponse
+
+          rce_url = os.environ["RCE_URL"]
+          bucket_name = os.environ["BUCKET_NAME"]
+
+          def handler(event, context):
+              rce_body = """<!DOCTYPE html>
+              <html lang="en">
+
+              <head>
+                  <meta charset="utf-8" />
+                  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+                  <meta name="description" content="" />
+                  <meta name="author" content="" />
+                  <title>Serverless Application - Command Injection</title>
+                  <!-- Favicon-->
+                  <link rel="icon" type="image/x-icon" href="assets/favicon.ico" />
+                  <!-- Bootstrap icons-->
+                  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.4.1/font/bootstrap-icons.css" rel="stylesheet" />
+                  <!-- Core theme CSS (includes Bootstrap)-->
+                  <link href="css/styles.css" rel="stylesheet" />
+              </head>
+
+              <body>
+                  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+                  <script>
+                      // call out to API gateway endpoint setup
+                      var sqlapi = (searchName) => {
+                          var myHeaders = new Headers();
+                          myHeaders.append("Content-Type", "application/json");
+                          // using built in JSON utility package turn object to string and store in a variable
+                          var rawPayload = JSON.stringify({
+                              "Name": searchName
+                          });
+                          // create a JSON object with parameters for API call and store in a variable
+                          var requestOptions = {
+                              method: 'POST',
+                              headers: myHeaders,
+                              body: rawPayload,
+                              redirect: 'follow'
+                          };
+                          // make API endpoint fetch and place respnse in empty div
+                          fetch("""
+
+              rce2 = """, requestOptions)
+                          .then(response => response.text())
+                          .then(result => {
+                              var response = JSON.parse(result).body;
+                              $("#response-text").html(response);
+                              $("#response-modal").modal('show');
+                          })
+                          .catch(error => console.log('error', error));
+
+                  }
+              </script>
+              <!-- Responsive navbar-->
+              <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+                  <div class="container px-5">
+                      <a class="navbar-brand" href="index.html">Web App</a>
+                      <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarSupportedContent" aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation"><span class="navbar-toggler-icon"></span></button>
+                      <div class="collapse navbar-collapse" id="navbarSupportedContent">
+                          <ul class="navbar-nav ms-auto mb-2 mb-lg-0">
+                              <li class="nav-item"><a class="nav-link" aria-current="page" href="index.html"><i class="bi bi-house"></i> Home</a></li>
+                              <li class="nav-item"><a class="nav-link active" aria-current="page" href="cmi.html"><i class="bi bi-terminal"></i> Command Injection</a></li>
+                          </ul>
+                      </div>
+                  </div>
+              </nav>
+              <!-- Header-->
+              <header>
+                  <div class="container px-5">
+                      <div class="row gx-5 justify-content-center">
+                          <div class="col-lg-10">
+                              <div class="text-center my-5">
+                                  <div class="feature bg-danger bg-gradient text-white rounded-3 mb-3"><i class="bi bi-terminal"></i></div>
+                                  <h2>Command Injection</h2>
+                                  <p>Command Injection attacks main objective is to be able to execute arbitrary commands on the Operating System(OS)</p>
+                                  <p>For more information please see <a href="https://owasp.org/www-community/attacks/Command_Injection" target="_blank" style="color: cornflowerblue;">Owasp - Command Injection</a></p>
+                              </div>
+                          </div>
+                      </div>
+                  </div>
+              </header>
+              <!-- MFU section-->
+              <section class="py-5" id="mfu">
+                  <div class="container px-5 my-5">
+                      <div class="row gx-5">
+                          <div class="col-lg-12">
+                              <div class="card">
+                                  <div class="card-body">
+                                      <h4>How to execute</h4>
+                                      <p>Provided is a simple search box that allows to retrieve an IP address from a DNS name.
+                                          <br> Example: <b>google.com</b>, the return response would be <b>x.x.x.x</b></p>
+                                      <p>Poor coding practices on this function allow for simple command injections</p>
+                                  </div>
+                              </div>
+                          </div>
+                      </div>
+                      <br>
+                      <div class="row gx-5">
+                          <div class="col-lg-6">
+                              <div class="card">
+                                  <div class="card-body">
+                                      <h4>1. Copy the commands </h4>
+                                      <p>google.com && whoami<br>google.com && env</p>
+                                  </div>
+                              </div>
+                          </div>
+                          <div class="col-lg-6">
+                              <div class="card">
+                                  <div class="card-body">
+                                      <h4>2. Paste in the box </h4>
+                                      <form method="post" onkeydown="return event.key != 'Enter';">
+                                          <label>Search DNS Name :</label>
+                                          <div class="input-group">
+                                              <input type="text" class="form-control" id="searchName" aria-label="Text input with segmented dropdown button">
+                                              <button type="button" class="btn btn-outline-danger" onclick="sqlapi(document.getElementById('searchName').value)">Submit</button>
+                                          </div>
+                                      </form>
+                                  </div>
+                              </div>
+                          </div>
+                      </div>
+                  </div>
+              </section>
+              <!-- Footer-->
+              <!-- <footer class="footer py-3 bg-dark fixed-bottom" style="margin-bottom: 0%;">
+                          <div class="container px-5">
+                              <p class="m-0 text-center text-white">Serverless Application 2021</p>
+                          </div>
+                      </footer> -->
+              <!-- Bootstrap core JS-->
+              <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.1/dist/js/bootstrap.bundle.min.js"></script>
+
+          </body>
+          <div class="modal" id="response-modal" tabindex="-1" role="dialog" aria-hidden="true">
+              <div class="modal-dialog modal-md">
+                  <div class="modal-content">
+                      <div class="modal-header">
+                          <h4 class="modal-title" id="myModalLabel"> Response </h4>
+                          <button type="button" class="btn btn-danger btn-simple" data-bs-dismiss="modal">&times;</button>
+                      </div>
+                      <div class="modal-body" id="response-text">
+
+                      </div>
+                  </div>
+              </div>
+          </div>
+
+          </html>
+              """
+        
+              s3 = boto3.client('s3')
+
+              responseValue = event['RequestType']
+              responseData = {}
+              responseData['Data'] = responseValue
+              
+              if responseValue == "Create":
+                rcebody = (rce_body + f'"{rce_url}"'+ rce2)
+                rce_html = "cmi.html"
+                uploadrce = s3.put_object(Body=rcebody, Bucket=bucket_name, Key=rce_html, ContentType='text/html', ACL='public-read')
+                
+                css_key = 'application-security/python-app-styles/css/styles.css'
+                immersionday_bucket = 'immersionday-workshops-trendmicro'
+                cssbody = s3.get_object(Bucket=immersionday_bucket, Key=css_key).get('Body').read()
+                uploadcss = s3.put_object(Body=cssbody, Bucket=bucket_name, Key='css/styles.css', ContentType='text/css', ACL='public-read')
+                
+                archi_key = 'application-security/python-app-styles/assets/architecture.png'
+                archibody = s3.get_object(Bucket=immersionday_bucket, Key=archi_key).get('Body').read()
+                uploadarchi = s3.put_object(Body=archibody, Bucket=bucket_name, Key='assets/architecture.png', ContentType='image/x-png', ACL='public-read')
+                
+                favi_key = 'application-security/python-app-styles/assets/favicon.ico'
+                favibody = s3.get_object(Bucket=immersionday_bucket, Key=favi_key).get('Body').read()
+                uploadfavi = s3.put_object(Body=favibody, Bucket=bucket_name, Key='assets/favicon.ico', ContentType='image/x-icon', ACL='public-read')
+                
+                index_key = 'application-security/python-app-styles/index.html'
+                indexbody = s3.get_object(Bucket=immersionday_bucket, Key=index_key).get('Body').read()
+                uploadindex = s3.put_object(Body=indexbody, Bucket=bucket_name, Key='index.html', ContentType='text/html', ACL='public-read')
+              
+              else:
+                 resource_s3 = boto3.resource('s3')
+                 bucket = resource_s3.Bucket(bucket_name)
+                 bucket.objects.all().delete()
+
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              
+      MemorySize: 512
+      Timeout: 200
+      Role: !GetAtt "htmllambdarole.Arn"
+  
+  htmllambdarole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Action: "sts:AssumeRole"
+          Effect: "Allow"
+          Principal:
+            Service: "lambda.amazonaws.com"
+      Policies:
+      - PolicyName: !Join ["-",[!Ref AWS::StackName, "htmlpolicy"]]
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action:
+            - "cloudwatch:PutMetricData"
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+            - "logs:CreateLogGroup"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            - "iam:ListAttachedRolePolicies"
+            - "iam:AttachRolePolicy"
+            - "s3:*"
+            Resource: "*"
+          - Effect: "Allow"
+            Action: 
+            - "s3:*"
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref S3Bucket
+                - /*
+          - Effect: "Allow"
+            Action: 
+            - "s3:*"
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref S3Bucket
+  
+  primerinvoke:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - "htmlLambdaFunction"
+    Version: "1.0"
+    Properties:
+      ServiceToken: !GetAtt htmlLambdaFunction.Arn
+      FunctionName: !Ref htmlLambdaFunction
+
+Outputs:
+  WebsiteURL:
+    Value: !GetAtt 
+      - S3Bucket
+      - WebsiteURL
+    Description: URL for website hosted on S3
+  RCEApiGatewayInvokeURL:
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/dev/rce"
+    Description: RCE apigateway url
